@@ -1,4 +1,4 @@
-use chrono::{DateTime, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use fuzzy_matcher::FuzzyMatcher;
 use getrandom::SysRng;
 use poise::CreateReply;
@@ -8,8 +8,8 @@ use serenity::{
     Client,
     all::{ChannelId, GatewayIntents, GuildId, UserId, prelude::EventHandler},
     async_trait,
-    builder::{CreateEmbed, CreateEmbedAuthor, CreateMessage},
-    model::user::OnlineStatus,
+    builder::{CreateEmbed, CreateMessage},
+    model::{guild::Guild, user::OnlineStatus},
 };
 use std::{
     collections::HashMap,
@@ -67,7 +67,8 @@ async fn main() {
     let bot_data = Arc::new(RwLock::new(bot_data));
     let init_data = bot_data.clone();
 
-    let intents = GatewayIntents::GUILD_MEMBERS | GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILDS;
+    let intents =
+        GatewayIntents::GUILD_MEMBERS | GatewayIntents::DIRECT_MESSAGES | GatewayIntents::GUILDS;
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -118,10 +119,6 @@ async fn main() {
         .setup(|ctx, _, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                // if let Err(err) = poise::builtins::register_globally(ctx, &[deregister()]).await {
-                //     println!("Error in setup: failed to register global commands!\n{err}");
-                //     return Err(err);
-                // }
                 Ok(init_data)
             })
         })
@@ -155,11 +152,11 @@ async fn main() {
     tokio::spawn(async move {
         while !die1.load(Ordering::Relaxed) {
             let until_midnight = Utc::now()
-                .with_hour(20)
+                .with_hour(23)
                 .unwrap()
-                .with_minute(52)
+                .with_minute(59)
                 .unwrap()
-                .with_second(0)
+                .with_second(59)
                 .unwrap()
                 .signed_duration_since(Utc::now())
                 .to_std()
@@ -205,9 +202,13 @@ async fn main() {
                         .fields(fields),
                 );
                 if let Err(err) = channel_id.send_message((&cache, http.as_ref()), msg).await {
-                    println!("Failed to send registrar update to `{guild_id}/{channel_id}`: {err:?}");
+                    println!(
+                        "Failed to send registrar update to `{guild_id}/{channel_id}`: {err:?}"
+                    );
                 } else {
-                    println!("Posted registrar update to guild id `{guild_id}/{channel_id}` successfully");
+                    println!(
+                        "Posted registrar update to guild id `{guild_id}/{channel_id}` successfully"
+                    );
                 }
             }
             if let Err(err) = write_cfg_file_noreply(&bot_data).await {
@@ -236,6 +237,7 @@ impl EventHandler for Handler {
 }
 
 #[poise::command(slash_command)]
+/// Sends command registration buttons
 pub async fn commands(ctx: Context<'_>) -> Result<(), Error> {
     poise::builtins::register_application_commands_buttons(ctx).await?;
     Ok(())
@@ -246,6 +248,7 @@ pub async fn commands(ctx: Context<'_>) -> Result<(), Error> {
     install_context = "Guild",
     interaction_context = "Guild|BotDm"
 )]
+/// Remove your user registration. In DMs removes all registrations, in server removes that server only.
 pub async fn deregister(ctx: Context<'_>) -> Result<(), Error> {
     let user_id = ctx.author().id;
     let modified = match ctx.guild_id() {
@@ -295,23 +298,122 @@ pub async fn register(_: Context<'_>) -> Result<(), Error> {
     Ok(())
 }
 
+async fn autocomplete_registered_guilds(
+    ctx: Context<'_>,
+    partial: &str,
+) -> impl Iterator<Item = String> {
+    let matcher = fuzzy_matcher::skim::SkimMatcherV2::default();
+    let mut collection = Vec::new();
+    for (gid, cfg) in ctx.data().read().await.iter() {
+        if cfg.read().await.users.contains_key(&ctx.author().id) {
+            let guild_name = ctx.http().get_guild(*gid).await.unwrap().name;
+            if matcher.fuzzy_match(&guild_name, partial).is_some() {
+                collection.push(guild_name);
+            }
+        }
+    }
+    collection.into_iter()
+}
+
+async fn user_is_registered(ctx: Context<'_>) -> Result<bool, Error> {
+    if let Some(cfg) = ctx.data().read().await.get(&ctx.guild_id().unwrap()) {
+        Ok(cfg.read().await.users.contains_key(&ctx.author().id))
+    } else {
+        Ok(false)
+    }
+}
+
+async fn user_not_registered(ctx: Context<'_>) -> Result<bool, Error> {
+    user_is_registered(ctx).await.map(std::ops::Not::not)
+}
+
 #[poise::command(
     slash_command,
     rename = "copy",
-    // install_context = "Guild",
-    // interaction_context = "Guild"
+    install_context = "Guild",
+    interaction_context = "Guild",
+    check = "user_not_registered",
+    ephemeral = true,
 )]
-pub async fn register_copy(ctx: Context<'_>) -> Result<(), Error> {
+/// Copy your pronouns from another server to the one you send this command in
+pub async fn register_copy(
+    ctx: Context<'_>,
+    #[description = "Server to copy from"]
+    #[autocomplete = "autocomplete_registered_guilds"]
+    guild: Guild,
+) -> Result<(), Error> {
+    let mut copy = ctx
+        .data()
+        .read()
+        .await
+        .get(&guild.id)
+        .unwrap()
+        .read()
+        .await
+        .users
+        .get(&ctx.author().id)
+        .unwrap()
+        .clone();
+    copy.last_set = Utc::now();
+    let _ = ctx
+        .data()
+        .read()
+        .await
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .write()
+        .await
+        .users
+        .insert(ctx.author().id, copy);
+    write_cfg_file(ctx).await?;
+    ctx.reply("Registration successful!").await?;
     Ok(())
 }
 
 #[poise::command(
     slash_command,
     rename = "new",
-    // install_context = "Guild",
-    // interaction_context = "Guild"
+    install_context = "Guild",
+    interaction_context = "Guild",
+    check = "user_not_registered",
+    ephemeral = true,
 )]
-pub async fn register_new(ctx: Context<'_>) -> Result<(), Error> {
+/// Register with this server, and provide a list of pronouns to use
+pub async fn register_new(
+    ctx: Context<'_>,
+    #[description = "Pronouns to register with. Separate with commas, must be alphabetic and under 10 chars."]
+    pronouns: String,
+) -> Result<(), Error> {
+    let pronouns = pronouns.split(',').map(str::to_string).collect::<Vec<_>>();
+    for pn in &pronouns {
+        if !pn.chars().all(|c| c.is_alphabetic() || c == '/') {
+            let msg = format!("Pronoun `{pn}` contains non-alphabetic character that is not `/`!");
+            ctx.reply(&msg).await?;
+            return Err(msg.into());
+        }
+        if pn.len() > 10 {
+            let msg = format!("Pronoun `{pn}` has length exceeding maximum (10)!");
+            ctx.reply(&msg).await?;
+            return Err(msg.into());
+        }
+    }
+    let user_data = UserData {
+        current: UnwrapErr(SysRng).random_range(0..pronouns.len()),
+        last_set: Utc::now(),
+        pronouns,
+    };
+    let _ = ctx
+        .data()
+        .read()
+        .await
+        .get(&ctx.guild_id().unwrap())
+        .unwrap()
+        .write()
+        .await
+        .users
+        .insert(ctx.author().id, user_data);
+    write_cfg_file(ctx).await?;
+    ctx.reply("Registration successful!").await?;
     Ok(())
 }
 
@@ -320,8 +422,8 @@ pub async fn register_new(ctx: Context<'_>) -> Result<(), Error> {
     install_context = "Guild",
     interaction_context = "Guild"
 )]
+/// Shows the current listing of pronouns for registered users in this server
 pub async fn registrar(ctx: Context<'_>) -> Result<(), Error> {
-    // let now = Utc::now();
     let Some(partial_guild) = ctx.partial_guild().await else {
         ctx.send(
             CreateReply::default()
@@ -341,16 +443,7 @@ pub async fn registrar(ctx: Context<'_>) -> Result<(), Error> {
         .await
         .users
         .iter()
-        // .iter_mut()
-        .map(|(user_id, user_data)| {
-            // if now.signed_duration_since(user_data.last_set).abs() >= TimeDelta::days(1) {
-            // let new_idx = UnwrapErr(SysRng).random_range(0..user_data.pronouns.len());
-            // user_data.current = new_idx;
-            // user_data.last_set = now;
-            // changed = true;
-            // }
-            (*user_id, user_data.pronouns[user_data.current].clone())
-        })
+        .map(|(user_id, user_data)| (*user_id, user_data.pronouns[user_data.current].clone()))
         .collect::<Vec<_>>();
     let mut fields = Vec::with_capacity(user_data.len());
     for (id, current_pronoun) in user_data.into_iter() {
@@ -359,18 +452,8 @@ pub async fn registrar(ctx: Context<'_>) -> Result<(), Error> {
     }
     fields.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // let my_name = ctx.cache().current_user().name.clone();
-    // let my_icon_url = ctx.cache().current_user().avatar_url().unwrap();
-
-    ctx.send(
-        CreateReply::default().embed(
-            CreateEmbed::new()
-                .title("Registrar")
-                // .author(CreateEmbedAuthor::new(my_name).icon_url(my_icon_url))
-                .fields(fields),
-        ),
-    )
-    .await?;
+    ctx.send(CreateReply::default().embed(CreateEmbed::new().title("Registrar").fields(fields)))
+        .await?;
 
     Ok(())
 }
@@ -380,6 +463,7 @@ pub async fn registrar(ctx: Context<'_>) -> Result<(), Error> {
     install_context = "Guild|User",
     interaction_context = "Guild|BotDm"
 )]
+/// Reroll your pronouns in this server
 pub async fn reroll(ctx: Context<'_>) -> Result<(), Error> {
     let modified = if let Some(guild_id) = ctx.guild_id() {
         if let Some(user_data) = ctx
@@ -455,6 +539,7 @@ async fn autocomplete_channels(ctx: Context<'_>, partial: &str) -> impl Iterator
     rename = "announcement",
     required_bot_permissions = "SEND_MESSAGES"
 )]
+/// Set the channel to send the pronouns update in for this server
 pub async fn set_announce_channel(
     ctx: Context<'_>,
     #[description = "Set the channel to send the daily update in"]
@@ -463,15 +548,12 @@ pub async fn set_announce_channel(
 ) -> Result<(), Error> {
     let guild_channel = match channel {
         Some(channel) => channel,
-        None => ctx.guild_channel().await.unwrap()
+        None => ctx.guild_channel().await.unwrap(),
     };
     let my_perms_in_channel = {
         let guild = ctx.guild().unwrap();
         let my_member = guild.members.get(&ctx.framework().bot_id).unwrap();
         guild.user_permissions_in(&guild_channel, my_member)
-        // let pg = ctx.partial_guild().await.unwrap();
-        // let my_member = pg.member(ctx, ctx.framework().bot_id).await.unwrap();
-        // pg.user_permissions_in(&guild_channel, &my_member)
     };
     if my_perms_in_channel.send_messages() {
         let channel_id = guild_channel.id;
